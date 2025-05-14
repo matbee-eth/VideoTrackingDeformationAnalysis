@@ -1,0 +1,355 @@
+import torch
+import imageio.v3 as iio
+import numpy as np
+import os
+import cv2 # For image processing if needed
+from PIL import Image
+
+# Attempt to import SAM2 and Florence-2 components
+SAM2_AVAILABLE = False
+FLORENCE2_AVAILABLE = False
+
+try:
+    from sam2.build_sam import build_sam2
+    from sam2.sam2_image_predictor import SAM2ImagePredictor
+    SAM2_AVAILABLE = True
+except ImportError:
+    print("SAM2 library not found. Please ensure it is installed correctly (e.g., from git).")
+
+try:
+    from transformers import AutoProcessor, AutoModelForCausalLM
+    FLORENCE2_AVAILABLE = True
+except ImportError:
+    print("Transformers library not found. Please install it for Florence-2.")
+
+# --- Model Configuration ---
+# These should ideally be configurable or passed as arguments
+FLORENCE2_MODEL_ID = "microsoft/Florence-2-large"
+# Make sure SAM2_CHECKPOINT and SAM2_CONFIG paths are correct for your setup
+# For now, assuming they might be in a 'checkpoints' or 'configs' directory relative to the project root
+# or that the SAM2 library handles finding them if installed system-wide.
+# These paths will likely need adjustment based on actual installation.
+SAM2_CHECKPOINT_PATH = os.getenv("SAM2_CHECKPOINT_PATH", "checkpoints/sam2.1_hiera_large.pt") # Or your actual path
+SAM2_CONFIG_PATH = os.getenv("SAM2_CONFIG_PATH", "configs/sam2.1/sam2.1_hiera_l.yaml") # Or your actual path
+
+# Task prompt for Florence-2. Open Vocabulary Detection seems most appropriate for "find 'object'"
+FLORENCE2_TASK_PROMPT = "<OPEN_VOCABULARY_DETECTION>"
+
+
+def load_reference_frame(video_path: str, frame_index: int = 0) -> np.ndarray | None:
+    """Loads a specific frame from a video path."""
+    try:
+        frames = []
+        for i, frame_data in enumerate(iio.imiter(video_path, plugin="FFMPEG")):
+            if i == frame_index:
+                # Ensure frame is HWC, RGB
+                if frame_data.ndim == 2: frame_data = cv2.cvtColor(frame_data, cv2.COLOR_GRAY2RGB)
+                if frame_data.shape[2] == 4: frame_data = cv2.cvtColor(frame_data, cv2.COLOR_RGBA2RGB)
+                if frame_data.dtype != np.uint8: frame_data = frame_data.astype(np.uint8)
+                frames.append(frame_data)
+                break
+        if frames:
+            print(f"Loaded frame {frame_index} from {video_path}")
+            return frames[0]
+        else:
+            print(f"Frame {frame_index} not found or video is shorter.")
+            return None
+    except Exception as e:
+        print(f"Error loading frame {frame_index} from video {video_path}: {e}")
+        return None
+
+def initialize_models(device_str: str):
+    """Initializes and returns Florence-2 and SAM2 models and predictors."""
+    if not SAM2_AVAILABLE or not FLORENCE2_AVAILABLE:
+        raise RuntimeError("SAM2 or Florence-2 libraries are not available. Please check installation.")
+
+    # Initialize Florence-2
+    print(f"Initializing Florence-2 model: {FLORENCE2_MODEL_ID} on device: {device_str}")
+    florence2_model = AutoModelForCausalLM.from_pretrained(FLORENCE2_MODEL_ID, trust_remote_code=True, torch_dtype='auto').eval().to(device_str)
+    florence2_processor = AutoProcessor.from_pretrained(FLORENCE2_MODEL_ID, trust_remote_code=True)
+    print("Florence-2 initialized.")
+
+    # Initialize SAM2
+    print(f"Initializing SAM2 model from checkpoint: {SAM2_CHECKPOINT_PATH} and config: {SAM2_CONFIG_PATH} on device: {device_str}")
+    if not os.path.exists(SAM2_CHECKPOINT_PATH):
+        raise FileNotFoundError(f"SAM2 Checkpoint not found at {SAM2_CHECKPOINT_PATH}. Please set SAM2_CHECKPOINT_PATH or place it correctly.")
+    if not os.path.exists(SAM2_CONFIG_PATH):
+         raise FileNotFoundError(f"SAM2 Config not found at {SAM2_CONFIG_PATH}. Please set SAM2_CONFIG_PATH or place it correctly.")
+
+    sam2_model_torch = build_sam2(SAM2_CONFIG_PATH, SAM2_CHECKPOINT_PATH, device=device_str)
+    sam2_predictor = SAM2ImagePredictor(sam2_model_torch)
+    print("SAM2ImagePredictor initialized.")
+
+    return florence2_model, florence2_processor, sam2_predictor
+
+def run_florence2_od(
+    model, processor, image_pil, text_input, task_prompt=FLORENCE2_TASK_PROMPT
+):
+    """Runs Florence-2 for object detection based on text input."""
+    device = model.device
+    prompt = task_prompt + text_input # Florence-2 expects the prompt this way for OD
+
+    inputs = processor(text=prompt, images=image_pil, return_tensors="pt").to(device)
+    if hasattr(inputs, 'pixel_values') and inputs.pixel_values.dtype == torch.float32 and device.type == 'cuda':
+        inputs.pixel_values = inputs.pixel_values.to(torch.bfloat16) # Or float16 if bfloat16 not supported
+
+
+    generated_ids = model.generate(
+        input_ids=inputs["input_ids"],
+        pixel_values=inputs["pixel_values"],
+        max_new_tokens=1024,
+        early_stopping=False,
+        do_sample=False,
+        num_beams=3,
+    )
+    generated_text = processor.batch_decode(generated_ids, skip_special_tokens=False)[0]
+    # The post_process_generation for OD returns a dict like: {'<OD>': {'bboxes': [[x1,y1,x2,y2], ...], 'labels': ["label1", ...]}}
+    parsed_answer = processor.post_process_generation(
+        generated_text, task=task_prompt, image_size=(image_pil.width, image_pil.height)
+    )
+    return parsed_answer
+
+
+def generate_initial_multipart_masks(
+    video_path: str,
+    text_prompts: list[str],
+    output_masks_path: str,
+    reference_frame_index: int = 0,
+    sam_checkpoint: str = SAM2_CHECKPOINT_PATH, # Allow override
+    sam_config: str = SAM2_CONFIG_PATH, # Allow override
+    florence_model_id: str = FLORENCE2_MODEL_ID # Allow override
+):
+    """
+    Generates initial segmentation masks for multiple parts based on text prompts
+    from a reference frame in a video.
+
+    Args:
+        video_path (str): Path to the input video file.
+        text_prompts (list[str]): A list of text descriptions for parts to segment
+                                  (e.g., ["head", "left leg", "tail"]).
+        output_masks_path (str): Path to save the output .npz file containing labeled masks.
+                                 The .npz file will store a dictionary where keys are prompts
+                                 and values are boolean mask arrays.
+        reference_frame_index (int): Index of the frame in the video to use for segmentation.
+        sam_checkpoint (str): Path to SAM2 model checkpoint.
+        sam_config (str): Path to SAM2 model config.
+        florence_model_id (str): HuggingFace model ID for Florence-2.
+    """
+    if not SAM2_AVAILABLE or not FLORENCE2_AVAILABLE:
+        print("Error: SAM2 or Florence-2 dependencies are not met. Cannot proceed.")
+        return
+
+    # Update global paths if overridden
+    global SAM2_CHECKPOINT_PATH, SAM2_CONFIG_PATH, FLORENCE2_MODEL_ID
+    SAM2_CHECKPOINT_PATH = sam_checkpoint
+    SAM2_CONFIG_PATH = sam_config
+    FLORENCE2_MODEL_ID = florence_model_id
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Using device: {device}")
+    
+    # Set up torch environment settings for CUDA if available
+    if device == "cuda":
+        torch.autocast(device_type="cuda", dtype=torch.bfloat16).__enter__()
+        if torch.cuda.get_device_properties(0).major >= 8: # Ampere+
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+
+
+    frame_np_hwc_rgb = load_reference_frame(video_path, reference_frame_index)
+    if frame_np_hwc_rgb is None:
+        print(f"Could not load reference frame {reference_frame_index} from {video_path}. Aborting.")
+        return
+
+    image_pil = Image.fromarray(frame_np_hwc_rgb)
+
+    try:
+        florence2_model, florence2_processor, sam2_predictor = initialize_models(device)
+    except (RuntimeError, FileNotFoundError) as e:
+        print(f"Error initializing models: {e}. Aborting.")
+        return
+
+    labeled_masks = {}
+    sam2_predictor.set_image(frame_np_hwc_rgb) # Set image once for SAM2
+
+    print(f"Processing {len(text_prompts)} text prompts: {text_prompts}")
+    for text_prompt in text_prompts:
+        print(f"  Processing prompt: '{text_prompt}'")
+        try:
+            # Run Florence-2 to get bounding boxes for the current text prompt
+            # For open_vocabulary_detection, the text_input is the objects to detect
+            florence_results = run_florence2_od(
+                florence2_model, florence2_processor, image_pil, text_input=text_prompt
+            )
+            
+            # Extract bboxes and labels. We expect one primary detection for the prompt.
+            # The result format is {'<OPEN_VOCABULARY_DETECTION>': {'bboxes': [[x,y,x,y], ...], 'labels': ['text_prompt', ...]}}
+            detections = florence_results.get(FLORENCE2_TASK_PROMPT, {})
+            bboxes_all = detections.get("bboxes", [])
+            labels_all = detections.get("labels", [])
+
+            # Filter for boxes that match the current prompt, though OD often returns the prompt as label
+            input_boxes_for_prompt = []
+            for i, label in enumerate(labels_all):
+                # Simple exact match, might need more sophisticated matching if Florence-2 adds qualifiers
+                if label.lower() == text_prompt.lower() and i < len(bboxes_all):
+                    input_boxes_for_prompt.append(bboxes_all[i])
+            
+            if not input_boxes_for_prompt:
+                print(f"    Florence-2 did not return a bounding box for prompt: '{text_prompt}'. Skipping.")
+                # print(f"    Full Florence-2 output for this prompt: {florence_results}") # For debugging
+                continue
+
+            # Take the first box if multiple are returned for the exact prompt (should be rare for specific parts)
+            # Or, one could decide to merge them or handle them differently.
+            # For SAM, we typically provide one box per object of interest for a clean mask.
+            # If Florence-2 returns multiple distinct objects for a single prompt (e.g. "two hands"),
+            # SAM will try to segment both within that one box, or we might need to pass boxes individually.
+            # For now, let's assume one primary box per part prompt.
+            
+            # We need to convert to numpy array for SAM2
+            # SAM expects N x 4 boxes
+            sam_input_box_np = np.array(input_boxes_for_prompt[0]).reshape(1, 4)
+            print(f"    Got box from Florence-2: {sam_input_box_np}")
+
+            # Predict mask with SAM2 using the box
+            masks_sam, scores_sam, _ = sam2_predictor.predict(
+                point_coords=None,
+                point_labels=None,
+                box=sam_input_box_np, # Expects numpy array
+                multimask_output=False, # Get single best mask
+            )
+            
+            # masks_sam is typically (num_masks_output, H, W) bool array
+            if masks_sam.ndim == 3 and masks_sam.shape[0] == 1:
+                final_mask = masks_sam.squeeze(0) # Get (H, W) mask
+                labeled_masks[text_prompt] = final_mask.astype(bool) # Store boolean mask
+                print(f"    Generated and stored mask for '{text_prompt}'. Mask shape: {final_mask.shape}, Non-zero elements: {np.sum(final_mask)}")
+            else:
+                print(f"    SAM2 did not return a single valid mask for prompt '{text_prompt}' with box {sam_input_box_np}. Mask shape: {masks_sam.shape}. Skipping.")
+
+        except Exception as e:
+            print(f"    Error processing prompt '{text_prompt}': {e}")
+            import traceback
+            traceback.print_exc()
+
+    if labeled_masks:
+        # Ensure output directory exists
+        output_dir = os.path.dirname(output_masks_path)
+        if output_dir and not os.path.exists(output_dir):
+            os.makedirs(output_dir, exist_ok=True)
+            print(f"Created output directory: {output_dir}")
+
+        np.savez_compressed(output_masks_path, **labeled_masks)
+        print(f"Saved {len(labeled_masks)} labeled masks to: {output_masks_path}")
+        print(f"Labels saved: {list(labeled_masks.keys())}")
+    else:
+        print("No masks were generated. Output file not saved.")
+
+    if device == "cuda":
+        torch.autocast(device_type="cuda", enabled=False).__exit__(None, None, None)
+
+
+if __name__ == "__main__":
+    print("Running Stage A: Initial Multi-Part Mask Generation (Example)")
+
+    # --- Configuration for Example Usage ---
+    # Create dummy video and checkpoint/config files if they don't exist for a basic run
+    DUMMY_VIDEO_PATH = "examples/videos/dummy_video.mp4"
+    DUMMY_OUTPUT_MASKS_PATH = "examples/outputs/stage_a_initial_masks.npz"
+    
+    # Ensure example directories exist
+    os.makedirs(os.path.dirname(DUMMY_VIDEO_PATH), exist_ok=True)
+    os.makedirs(os.path.dirname(DUMMY_OUTPUT_MASKS_PATH), exist_ok=True)
+
+    # Create a small dummy MP4 video if it doesn't exist
+    if not os.path.exists(DUMMY_VIDEO_PATH):
+        print(f"Creating dummy video at {DUMMY_VIDEO_PATH}")
+        try:
+            # Create 10 frames of a 100x100 black image
+            frames = [np.zeros((100, 100, 3), dtype=np.uint8) for _ in range(10)]
+            # Add a moving white square for basic testing if models were real
+            for i in range(10):
+                frames[i][i*5:i*5+20, i*5:i*5+20, :] = 255
+            iio.mimwrite(DUMMY_VIDEO_PATH, frames, fps=5, plugin="FFMPEG", codec="libx264")
+            print("Dummy video created.")
+        except Exception as e:
+            print(f"Could not create dummy video (ffmpeg/libx264 may not be installed/configured): {e}")
+            print("Please ensure ffmpeg is installed and accessible by imageio, or provide a real video.")
+            # If dummy video creation fails, the script might not run without a real video.
+
+    # --- Check for SAM2 checkpoint and config ---
+    # This example won't run without actual models.
+    # The user needs to download SAM2 checkpoints and provide correct paths.
+    # e.g., from https://github.com/facebookresearch/sam2
+    # And ensure Florence-2 can be downloaded by HuggingFace transformers.
+
+    sam_ckpt = SAM2_CHECKPOINT_PATH
+    sam_cfg = SAM2_CONFIG_PATH
+
+    if not (os.path.exists(sam_ckpt) and os.path.exists(sam_cfg)):
+        print("-" * 50)
+        print("WARNING: SAM2 checkpoint or config file not found at specified paths:")
+        print(f"  Checkpoint: {sam_ckpt} (exists: {os.path.exists(sam_ckpt)})")
+        print(f"  Config: {sam_cfg} (exists: {os.path.exists(sam_cfg)})")
+        print("The script will likely fail during model initialization if these are not correct.")
+        print("Please download SAM2 models and update SAM2_CHECKPOINT_PATH and SAM2_CONFIG_PATH environment variables or arguments.")
+        print("Skipping example run if dummy video also doesn't exist and models are missing.")
+        print("-" * 50)
+        if not os.path.exists(DUMMY_VIDEO_PATH):
+             exit() # Exit if no video and no models to avoid crashing later
+
+    # Example text prompts
+    # These are illustrative. The success depends entirely on Florence-2's ability
+    # to detect these specific terms in the given image.
+    prompts = ["bird body", "bird head", "bird tail", "bird leg"]
+    # prompts = ["a small red apple", "a green banana"] # More generic prompts
+
+    print(f"Attempting to generate masks for prompts: {prompts}")
+    print(f"Using video: {DUMMY_VIDEO_PATH}")
+    print(f"Saving masks to: {DUMMY_OUTPUT_MASKS_PATH}")
+
+    # Check if the dummy video exists before trying to process it
+    if os.path.exists(DUMMY_VIDEO_PATH):
+        try:
+            generate_initial_multipart_masks(
+                video_path=DUMMY_VIDEO_PATH,
+                text_prompts=prompts,
+                output_masks_path=DUMMY_OUTPUT_MASKS_PATH,
+                reference_frame_index=0, # Use the first frame
+                sam_checkpoint=sam_ckpt,
+                sam_config=sam_cfg
+            )
+            print("-" * 30)
+            print("Example run finished.")
+            if os.path.exists(DUMMY_OUTPUT_MASKS_PATH):
+                print(f"Output potentially saved to {DUMMY_OUTPUT_MASKS_PATH}")
+                # Verify contents (optional)
+                try:
+                    loaded_data = np.load(DUMMY_OUTPUT_MASKS_PATH)
+                    print(f"  Successfully loaded. Contains keys: {list(loaded_data.keys())}")
+                    for key in loaded_data.keys():
+                        print(f"    Mask '{key}' shape: {loaded_data[key].shape}, type: {loaded_data[key].dtype}")
+                except Exception as e:
+                    print(f"  Error loading or inspecting output file: {e}")
+            else:
+                print(f"  Output file {DUMMY_OUTPUT_MASKS_PATH} was NOT created. Check logs for errors.")
+
+        except Exception as e:
+            print(f"An error occurred during the example run of generate_initial_multipart_masks: {e}")
+            import traceback
+            traceback.print_exc()
+            print("This likely means models (SAM2/Florence-2) could not be loaded or run.")
+            print("Please ensure checkpoints are correctly paths and all dependencies are installed.")
+    else:
+        print(f"Dummy video {DUMMY_VIDEO_PATH} does not exist, and SAM models might be missing. Skipping example execution.")
+        print("Please provide a video and ensure models are set up to run this stage.")
+
+    # For a real run, you would call:
+    # generate_initial_multipart_masks(
+    #     video_path="path/to/your/video.mp4",
+    #     text_prompts=["main subject", "left limb", "object of interest"],
+    #     output_masks_path="output/your_experiment_masks.npz",
+    #     reference_frame_index=0,
+    #     # Optionally override sam_checkpoint, sam_config, florence_model_id
+    # )
