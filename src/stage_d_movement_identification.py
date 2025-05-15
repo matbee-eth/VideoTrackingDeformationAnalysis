@@ -401,34 +401,27 @@ def identify_movement_areas(
                                         continue # Skip NaN points
 
                                     # Check CoTracker's visibility for this point at this frame
-                                    is_visible_in_stage_b = True # Default to true if visibility data is missing for some reason
+                                    is_visible_in_stage_b = False # Default to False: draw as ghost if no visibility info or explicitly not visible
                                     visibility_key = f"{label}_visibility"
                                     if stage_b_tracks_data and visibility_key in stage_b_tracks_data:
-                                        part_visibility_at_t = stage_b_tracks_data[visibility_key]
-                                        if part_visibility_at_t.shape[0] > t and original_point_index < part_visibility_at_t.shape[1]:
-                                            is_visible_in_stage_b = part_visibility_at_t[t, original_point_index]
-                                        # else:
-                                            # Potentially log if visibility index is out of bounds, but be cautious of spam
-                                            # print(f"Warning: Visibility index {original_point_index} for part '{label}' out of bounds at frame {t}.")
-                                            # is_visible_in_stage_b = False # Treat as not visible if index is bad
-                                    # else:
-                                        # print(f"Warning: Visibility data for part '{label}' not found in Stage B data.")
-                                        # is_visible_in_stage_b = False # Treat as not visible if key is missing
+                                        part_visibility_data = stage_b_tracks_data[visibility_key]
+                                        if part_visibility_data.shape[0] > t and original_point_index < part_visibility_data.shape[1]:
+                                            is_visible_in_stage_b = part_visibility_data[t, original_point_index]
+                                        # else: # Log if index out of bounds for visibility array
+                                            # print(f"Warning: Visibility index {original_point_index} for part '{label}' out of bounds for frame {t}.")
+                                    # else: # Log if visibility key is missing
+                                        # print(f"Warning: Visibility key {visibility_key} not found in Stage B data for part '{label}'.")
                                         
-                                    if not is_visible_in_stage_b:
-                                        continue # Skip drawing if CoTracker marked it not visible
-
-                                    pt_x, pt_y = int(point_coord_xy[0]), int(point_coord_xy[1])
-                                    
-                                    # Check if this point is active in the current frame
-                                    is_active_now = False
-                                    for active_region in current_frame_active_regions_by_part.get(label, []):
-                                        if original_point_index in active_region["point_indices_in_part"]:
-                                            is_active_now = True
-                                            break
-                                    
-                                    if not is_active_now: # Draw only if not active (active ones drawn below more prominently)
-                                        cv2.circle(frame, (pt_x, pt_y), radius=1, color=dimmed_color, thickness=-1)
+                                    # Determine drawing style if not active now
+                                    pt_x_int, pt_y_int = int(point_coord_xy[0]), int(point_coord_xy[1])
+                                    if is_visible_in_stage_b:
+                                        # Persistent, visible by CoTracker, but not active now
+                                        cv2.circle(frame, (pt_x_int, pt_y_int), radius=2, color=part_color, thickness=-1)
+                                    else:
+                                        # Persistent, NOT visible by CoTracker (or visibility data missing), and not active now (ghost point)
+                                        very_dimmed_color = tuple(c // 4 for c in part_color) # Even more dimmed for ghost points
+                                        cv2.circle(frame, (pt_x_int, pt_y_int), radius=2, color=very_dimmed_color, thickness=-1)
+                                        
                         # else:
                             # print(f"Warning: Track data for persistent points for part '{label}' not found or inconsistent for frame {t}.")
 

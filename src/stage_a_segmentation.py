@@ -90,6 +90,71 @@ SAM2_CONFIG_PATH = "sam2.1_hiera_l.yaml" # Or your actual path
 # Task prompt for Florence-2. Open Vocabulary Detection seems most appropriate for "find 'object'"
 FLORENCE2_TASK_PROMPT = "<OPEN_VOCABULARY_DETECTION>"
 
+# Helper for Stage A visualization
+def get_color_for_mask_label(label_index, num_labels, s=0.8, v=0.9):
+    # Use HSV color space for more distinct colors
+    # Calculate hue in 0-360 range, then map to 0-179 for OpenCV uint8 HSV
+    hue_360 = label_index * (360.0 / num_labels)
+    hue_180 = int(hue_360 % 180) # Scale to 0-179 range for OpenCV uint8
+    
+    saturation = int(s * 255)
+    value = int(v * 255)
+    
+    color_hsv = np.array([[[hue_180, saturation, value]]], dtype=np.uint8)
+    color_bgr = cv2.cvtColor(color_hsv, cv2.COLOR_HSV2BGR)[0][0]
+    return (int(color_bgr[0]), int(color_bgr[1]), int(color_bgr[2])) # BGR tuple
+
+def visualize_and_save_masks_on_frame(
+    frame_np_hwc_rgb: np.ndarray,
+    labeled_masks: dict, # {label_str: mask_bool_array_hw}
+    output_image_path: str,
+    alpha: float = 0.4 # Transparency of masks
+):
+    """Overlays masks on the frame and saves the image."""
+    if not labeled_masks:
+        print("No masks to visualize.")
+        return
+
+    vis_image_bgr = cv2.cvtColor(frame_np_hwc_rgb, cv2.COLOR_RGB2BGR)
+    overlay = vis_image_bgr.copy()
+
+    num_actual_masks = len(labeled_masks)
+    mask_labels = list(labeled_masks.keys())
+
+    for i, label in enumerate(mask_labels):
+        mask_hw = labeled_masks[label]
+        if not mask_hw.any(): # Skip empty masks
+            continue
+        
+        color_bgr = get_color_for_mask_label(i, num_actual_masks)
+        
+        # Apply color to mask region on the overlay
+        overlay[mask_hw] = color_bgr
+
+        # Add text label near mask centroid
+        try:
+            moments = cv2.moments(mask_hw.astype(np.uint8))
+            if moments["m00"] > 0:
+                center_x = int(moments["m10"] / moments["m00"])
+                center_y = int(moments["m01"] / moments["m00"])
+                cv2.putText(vis_image_bgr, label, (center_x, center_y - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 2, cv2.LINE_AA) # White text with black outline (effectively)
+                cv2.putText(vis_image_bgr, label, (center_x, center_y - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color_bgr, 1, cv2.LINE_AA)
+        except Exception as e_centroid:
+            print(f"    Could not calculate centroid or place text for label '{label}': {e_centroid}")
+
+    # Blend overlay with original image
+    cv2.addWeighted(overlay, alpha, vis_image_bgr, 1 - alpha, 0, vis_image_bgr)
+    
+    try:
+        output_dir = os.path.dirname(output_image_path)
+        if output_dir and not os.path.exists(output_dir):
+            os.makedirs(output_dir, exist_ok=True)
+        cv2.imwrite(output_image_path, vis_image_bgr)
+        print(f"Saved Stage A mask visualization to: {output_image_path}")
+    except Exception as e_save:
+        print(f"Error saving Stage A mask visualization: {e_save}")
 
 def load_reference_frame(video_path: str, frame_index: int = 0) -> np.ndarray | None:
     """Loads a specific frame from a video path."""
@@ -305,6 +370,12 @@ def generate_initial_multipart_masks(
             np.savez_compressed(output_masks_path, **labeled_masks)
             print(f"Saved {len(labeled_masks)} labeled masks to: {output_masks_path}")
             print(f"Labels saved: {list(labeled_masks.keys())}")
+
+            # --- Add visualization call here ---
+            vis_output_path = output_masks_path.replace(".npz", "_visualization.png")
+            visualize_and_save_masks_on_frame(frame_np_hwc_rgb, labeled_masks, vis_output_path)
+            # --- End visualization call ---
+
         else:
             print("No masks were generated. Output file not saved.")
 
@@ -322,10 +393,12 @@ if __name__ == "__main__":
     # Create dummy video and checkpoint/config files if they don't exist for a basic run
     DUMMY_VIDEO_PATH = "media/crow.mp4"
     DUMMY_OUTPUT_MASKS_PATH = "examples/outputs/stage_a_initial_masks.npz"
+    DUMMY_OUTPUT_VIS_PATH_A = "examples/outputs/stage_a_initial_masks_visualization.png" # For clarity
     
     # Ensure example directories exist
     os.makedirs(os.path.dirname(DUMMY_VIDEO_PATH), exist_ok=True)
     os.makedirs(os.path.dirname(DUMMY_OUTPUT_MASKS_PATH), exist_ok=True)
+    os.makedirs(os.path.dirname(DUMMY_OUTPUT_VIS_PATH_A), exist_ok=True)
 
     # Create a small dummy MP4 video if it doesn't exist
     if not os.path.exists(DUMMY_VIDEO_PATH):
@@ -367,7 +440,7 @@ if __name__ == "__main__":
     # Example text prompts
     # These are illustrative. The success depends entirely on Florence-2's ability
     # to detect these specific terms in the given image.
-    prompts = ["body", "head", "tail", "leg"]
+    prompts = ["body", "head", "tail", "leg", "eye", "wing", "beak", "foot", "neck", "back", "breast", "belly", "underbelly", "back", "breast", "belly", "underbelly", "back", "breast", "belly", "underbelly"]
     # prompts = ["a small red apple", "a green banana"] # More generic prompts
 
     print(f"Attempting to generate masks for prompts: {prompts}")
@@ -395,6 +468,9 @@ if __name__ == "__main__":
                     print(f"  Successfully loaded. Contains keys: {list(loaded_data.keys())}")
                     for key in loaded_data.keys():
                         print(f"    Mask '{key}' shape: {loaded_data[key].shape}, type: {loaded_data[key].dtype}")
+                    # Check for visualization file as well
+                    if os.path.exists(DUMMY_OUTPUT_MASKS_PATH.replace(".npz", "_visualization.png")):
+                        print(f"  Visualization potentially saved to: {DUMMY_OUTPUT_MASKS_PATH.replace('.npz', '_visualization.png')}")
                 except Exception as e:
                     print(f"  Error loading or inspecting output file: {e}")
             else:
