@@ -274,6 +274,20 @@ def identify_movement_areas(
         all_movement_regions_data["per_frame_regions"].append(frame_regions_data)
     print("  Finished Spatial Clustering.")
 
+    # --- Collect all persistent points for visualization ---
+    persistent_points_for_visualization = {label: set() for label in part_labels}
+    if "per_frame_regions" in all_movement_regions_data:
+        for frame_data in all_movement_regions_data["per_frame_regions"]:
+            for label, regions_in_frame in frame_data["regions_for_part"].items():
+                if label in persistent_points_for_visualization: # Ensure label is valid
+                    for region_details in regions_in_frame:
+                        persistent_points_for_visualization[label].update(region_details["point_indices_in_part"])
+    
+    # For debugging what was collected
+    # for label, indices in persistent_points_for_visualization.items():
+    #     print(f"  Persistent points for {label}: {len(indices)} points")
+
+
     # --- Leverage Inter-Part Motion ---
     print("\nLeveraging Inter-Part Motion data from Stage C...")
     inter_part_motion_results = {"centroid_velocities": {}}
@@ -358,31 +372,98 @@ def identify_movement_areas(
                         print(f"Warning: Could not read frame {t} from video. Stopping visualization early.")
                         break
                     
-                    frame_regions_summary = all_movement_regions_data["per_frame_regions"][t]
-                    for label_idx, label in enumerate(part_labels):
-                        if label not in stage_b_tracks_data.get(f"{label}_tracks_xy", np.array([])).shape: # check if part exists in tracks
-                             # This check is a bit off, stage_b_tracks_data[f"{label}_tracks_xy"] is the actual tracks array
-                             pass # Will check specific key later
+                    # Get currently active regions for this frame for quick lookup
+                    current_frame_active_regions_by_part = {}
+                    if t < len(all_movement_regions_data["per_frame_regions"]):
+                         current_frame_active_regions_by_part = all_movement_regions_data["per_frame_regions"][t]["regions_for_part"]
 
+                    # --- Draw all persistent points first (subtly if not active) ---
+                    for label in part_labels:
                         part_color = get_color_for_label(label, part_labels)
-                        regions_for_part = frame_regions_summary["regions_for_part"].get(label, [])
+                        dimmed_color = tuple(c // 2 for c in part_color) # Dimmed color for non-active persistent points
+
+                        current_persistent_indices = list(persistent_points_for_visualization.get(label, set()))
+                        if not current_persistent_indices:
+                            continue
+
+                        part_tracks_key = f"{label}_tracks_xy"
+                        if stage_b_tracks_data and part_tracks_key in stage_b_tracks_data:
+                            part_tracks_at_t = stage_b_tracks_data[part_tracks_key]
+                            if part_tracks_at_t.shape[0] > t and (not current_persistent_indices or np.max(current_persistent_indices) < part_tracks_at_t.shape[1]):
+                                points_xy_for_persistent = part_tracks_at_t[t, current_persistent_indices, :]
+                                
+                                for i, original_point_index in enumerate(current_persistent_indices):
+                                    # original_point_index is the index within the specific part's full list of points.
+                                    # We need to ensure this index is valid for the visibility array of the part.
+
+                                    point_coord_xy = points_xy_for_persistent[i, :]
+                                    if np.isnan(point_coord_xy[0]) or np.isnan(point_coord_xy[1]):
+                                        continue # Skip NaN points
+
+                                    # Check CoTracker's visibility for this point at this frame
+                                    is_visible_in_stage_b = True # Default to true if visibility data is missing for some reason
+                                    visibility_key = f"{label}_visibility"
+                                    if stage_b_tracks_data and visibility_key in stage_b_tracks_data:
+                                        part_visibility_at_t = stage_b_tracks_data[visibility_key]
+                                        if part_visibility_at_t.shape[0] > t and original_point_index < part_visibility_at_t.shape[1]:
+                                            is_visible_in_stage_b = part_visibility_at_t[t, original_point_index]
+                                        # else:
+                                            # Potentially log if visibility index is out of bounds, but be cautious of spam
+                                            # print(f"Warning: Visibility index {original_point_index} for part '{label}' out of bounds at frame {t}.")
+                                            # is_visible_in_stage_b = False # Treat as not visible if index is bad
+                                    # else:
+                                        # print(f"Warning: Visibility data for part '{label}' not found in Stage B data.")
+                                        # is_visible_in_stage_b = False # Treat as not visible if key is missing
+                                        
+                                    if not is_visible_in_stage_b:
+                                        continue # Skip drawing if CoTracker marked it not visible
+
+                                    pt_x, pt_y = int(point_coord_xy[0]), int(point_coord_xy[1])
+                                    
+                                    # Check if this point is active in the current frame
+                                    is_active_now = False
+                                    for active_region in current_frame_active_regions_by_part.get(label, []):
+                                        if original_point_index in active_region["point_indices_in_part"]:
+                                            is_active_now = True
+                                            break
+                                    
+                                    if not is_active_now: # Draw only if not active (active ones drawn below more prominently)
+                                        cv2.circle(frame, (pt_x, pt_y), radius=1, color=dimmed_color, thickness=-1)
+                        # else:
+                            # print(f"Warning: Track data for persistent points for part '{label}' not found or inconsistent for frame {t}.")
+
+
+                    # --- Draw currently active deforming regions (more prominently) ---
+                    # frame_regions_summary = all_movement_regions_data["per_frame_regions"][t] # Already got this as current_frame_active_regions_by_part
+                    for label in part_labels: # Iterate through labels again to ensure drawing order or use label_idx if preferred
+                        part_color = get_color_for_label(label, part_labels)
+                        
+                        regions_for_part = current_frame_active_regions_by_part.get(label, [])
                         
                         for region in regions_for_part:
                             point_indices_in_part = np.array(region["point_indices_in_part"])
                             centroid_xy = tuple(map(int, region["centroid_xy"]))
                             
-                            # Get original track coordinates for these points
                             part_tracks_key = f"{label}_tracks_xy"
-                            if part_tracks_key in stage_b_tracks_data and stage_b_tracks_data[part_tracks_key].shape[0] > t and stage_b_tracks_data[part_tracks_key].shape[1] > np.max(point_indices_in_part if len(point_indices_in_part) > 0 else [-1]):
-                                region_points_xy = stage_b_tracks_data[part_tracks_key][t, point_indices_in_part, :]
-                                for pt_idx in range(region_points_xy.shape[0]):
-                                    pt_x, pt_y = int(region_points_xy[pt_idx, 0]), int(region_points_xy[pt_idx, 1])
-                                    cv2.circle(frame, (pt_x, pt_y), radius=2, color=part_color, thickness=-1) # Draw points of the region
+                            # Ensure point_indices_in_part is not empty before np.max
+                            if stage_b_tracks_data and part_tracks_key in stage_b_tracks_data and \
+                               stage_b_tracks_data[part_tracks_key].shape[0] > t and \
+                               (point_indices_in_part.size == 0 or np.max(point_indices_in_part) < stage_b_tracks_data[part_tracks_key].shape[1]):
                                 
-                                cv2.drawMarker(frame, centroid_xy, color=(255,255,255), markerType=cv2.MARKER_CROSS, markerSize=10, thickness=1) # Centroid in white
-                                cv2.putText(frame, f"{label}_r{region['cluster_id']}", (centroid_xy[0]+5, centroid_xy[1]-5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, part_color, 1)
+                                if point_indices_in_part.size > 0: # Proceed only if there are points
+                                    region_points_xy = stage_b_tracks_data[part_tracks_key][t, point_indices_in_part, :]
+                                    for pt_idx in range(region_points_xy.shape[0]):
+                                        if np.isnan(region_points_xy[pt_idx, 0]) or np.isnan(region_points_xy[pt_idx, 1]):
+                                            continue
+                                        pt_x, pt_y = int(region_points_xy[pt_idx, 0]), int(region_points_xy[pt_idx, 1])
+                                        cv2.circle(frame, (pt_x, pt_y), radius=3, color=part_color, thickness=-1) # Active points brighter/larger
+                                
+                                cv2.drawMarker(frame, centroid_xy, color=(255,255,255), markerType=cv2.MARKER_STAR, markerSize=10, thickness=1) # Centroid for active
+                                cv2.putText(frame, f"{label[:4]}_r{region['cluster_id']}", (centroid_xy[0]+6, centroid_xy[1]-6), 
+                                            cv2.FONT_HERSHEY_SIMPLEX, 0.35, part_color, 1, cv2.LINE_AA)
                             else:
-                                print(f"Warning: Could not retrieve points for region in part '{label}' at frame {t} for visualization. Track data missing or inconsistent.")
+                                if point_indices_in_part.size > 0 : # Only print warning if there were points to draw
+                                     print(f"Warning: Could not retrieve points for ACTIVE region in part '{label}' at frame {t} for visualization. Track data missing or inconsistent. Max index: {np.max(point_indices_in_part) if point_indices_in_part.size > 0 else 'N/A'}, Track shape[1]: {stage_b_tracks_data[part_tracks_key].shape[1] if stage_b_tracks_data and part_tracks_key in stage_b_tracks_data else 'N/A'}")
 
                     video_writer.write(frame)
                 
