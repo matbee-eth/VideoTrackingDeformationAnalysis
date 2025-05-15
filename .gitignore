@@ -1,0 +1,3 @@
+examples/florence-sam/
+checkpoints/*.pt
+checkpoints/scaled_offline.pth

@@ -36,7 +36,7 @@ except ImportError as e:
 
 # --- Configuration ---
 # Path to CoTracker checkpoint. This should be set by the user or via an environment variable.
-COTRACKER_CHECKPOINT_PATH = os.getenv("COTRACKER_CHECKPOINT_PATH", "checkpoints/cotracker_stride_4_wind_8_patch_16.pth")
+COTRACKER_CHECKPOINT_PATH = os.getenv("COTRACKER_CHECKPOINT_PATH", "checkpoints/scaled_offline.pth")
 DEFAULT_POINTS_PER_PART = 256 # Target number of points to sample per mask part
 
 def load_video_frames_for_cotracker_bthwc_float(
@@ -172,21 +172,20 @@ def track_multipart_points(
     # CoTracker's `read_video_from_path` (often used in its demos) returns a BGR tensor, range 0-1.
     # Let's use that utility if available for consistency with CoTracker examples.
     try:
-        video_tensor_bgr_01_bthwc = read_video_from_path(original_video_path).to(device)
-        # CoTracker `predictor(video)` expects BGR, 0-1 range, B T C H W, where C=3
-        # Our `load_video_frames_for_cotracker_bthwc_float` is RGB, 0-255, B T H W C.
-        # `read_video_from_path` from cotracker.utils.visualizer returns B T H W C, range 0-1
-        # The predictor call itself also accepts a path.
-        # Let's pass the video path and let the predictor handle it if it does, otherwise load tensor.
-        # The main `CoTrackerPredictor.__call__` expects `rgbs` tensor (B, T, 3, H, W) according to its docstring.
-        # So, we need B T C H W with C=3 (RGB) and normalized. Let's prepare this.
-
         print(f"Loading video using CoTracker's read_video_from_path for consistency: {original_video_path}")
-        video_bthwc_01 = read_video_from_path(original_video_path) # Should be B T H W C, range 0-1
-        if video_bthwc_01 is None:
+        video_thwc_np = read_video_from_path(original_video_path) # Assuming T H W C numpy array, range 0-1
+        if video_thwc_np is None:
             print(f"Failed to load video: {original_video_path}")
             return
-        video_for_predictor = video_bthwc_01.permute(0, 1, 4, 2, 3).to(device) # B T C H W
+        
+        # Convert NumPy array to PyTorch tensor
+        video_thwc_tensor = torch.from_numpy(video_thwc_np).float() # T H W C
+
+        # Add batch dimension: B T H W C (B=1)
+        video_bthwc_tensor = video_thwc_tensor.unsqueeze(0) # 1 T H W C
+        
+        # Permute and move to device: B T C H W
+        video_for_predictor = video_bthwc_tensor.permute(0, 1, 4, 2, 3).to(device) # 1 T C H W
         print(f"Video tensor prepared for CoTracker predictor: {video_for_predictor.shape}, device: {video_for_predictor.device}")
 
     except Exception as e:
@@ -300,7 +299,7 @@ if __name__ == "__main__":
     # This example assumes Stage A has run and produced an initial_masks.npz file.
     # It also needs a video and a CoTracker checkpoint.
 
-    DUMMY_VIDEO_PATH_B = "examples/videos/dummy_video.mp4" # Same dummy video as Stage A
+    DUMMY_VIDEO_PATH_B = "media/crow.mp4" # Same dummy video as Stage A
     # This is the output from Stage A's example run
     DUMMY_INITIAL_MASKS_PATH_B = "examples/outputs/stage_a_initial_masks.npz" 
     DUMMY_OUTPUT_TRACKS_PATH_B = "examples/outputs/stage_b_multipart_tracks.npz"

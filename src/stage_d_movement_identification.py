@@ -281,7 +281,7 @@ def identify_movement_areas(
         print("  No parts found, skipping inter-part motion analysis.")
     else:
         for label in part_labels:
-            centroid_key = f"{label}_centroid_trajectory_f2"
+            centroid_key = f"{label}_centroid_xy_t2"
             if centroid_key in stage_c_data:
                 centroids_f2 = stage_c_data[centroid_key] # Should be (num_frames, 2)
                 if centroids_f2.ndim == 2 and centroids_f2.shape[0] > 1 and centroids_f2.shape[1] == 2:
@@ -434,7 +434,7 @@ if __name__ == "__main__":
 
     DUMMY_STAGE_C_ANALYSIS_PATH = "examples/outputs/stage_c_deformation_analysis.npz"
     DUMMY_OUTPUT_MOVEMENT_DATA_PATH_D = "examples/outputs/stage_d_movement_data.npz"
-    DUMMY_OUTPUT_VIS_PATH_D = "examples/outputs/stage_d_movement_visualization.txt" # Dummy viz
+    DUMMY_OUTPUT_VIS_PATH_D = "examples/outputs/stage_d_movement_visualization.mp4" # Changed to .mp4
 
     if not os.path.exists(DUMMY_STAGE_C_ANALYSIS_PATH):
         print(f"ERROR: Stage C analysis file not found at {DUMMY_STAGE_C_ANALYSIS_PATH}.")
@@ -447,12 +447,12 @@ if __name__ == "__main__":
         stage_c_analysis_path=DUMMY_STAGE_C_ANALYSIS_PATH,
         output_visualization_path=DUMMY_OUTPUT_VIS_PATH_D,
         output_movement_data_path=DUMMY_OUTPUT_MOVEMENT_DATA_PATH_D,
-        dilatation_threshold=0.05, # Example override
-        max_shear_threshold=0.05,  # Example override
+        dilatation_threshold=0.10, # Increased from 0.05
+        max_shear_threshold=0.10,  # Increased from 0.05
         temporal_consistency_window=3,
         min_region_points=5,
-        dbscan_eps=20.0, # Example, might need tuning based on point density in dummy data
-        dbscan_min_samples=3 # Example, should be >= min_region_points in general or tied to it
+        dbscan_eps=20.0, 
+        dbscan_min_samples=5 # Aligned with min_region_points, was 3
     )
 
     print("-" * 30)

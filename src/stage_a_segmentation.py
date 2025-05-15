@@ -4,6 +4,9 @@ import numpy as np
 import os
 import cv2 # For image processing if needed
 from PIL import Image
+import hydra
+from sam2.build_sam import build_sam2
+from omegaconf import OmegaConf
 
 # Attempt to import SAM2 and Florence-2 components
 SAM2_AVAILABLE = False
@@ -22,15 +25,67 @@ try:
 except ImportError:
     print("Transformers library not found. Please install it for Florence-2.")
 
+# hydra is initialized on import of sam2, which sets the search path which can't be modified
+# so we need to clear the hydra instance
+# hydra.core.global_hydra.GlobalHydra.instance().clear()
+# reinit hydra with a new search path for configs
+# hydra.initialize_config_module('/home/acidhax/dev/VideoTrackingDeformationAnalysis/configs/sam2.1', version_base='1.2')
+from omegaconf import DictConfig
+from hydra import compose
+from hydra.utils import instantiate
+from omegaconf import OmegaConf
+
+def build_sam2_(
+    config_file,  # Can be a config name (str) or a DictConfig
+    ckpt_path=None,
+    device="cuda",
+    mode="eval",
+    hydra_overrides_extra=[],
+    apply_postprocessing=True,
+    **kwargs
+):
+    # Allow passing an actual config object
+    if isinstance(config_file, DictConfig):
+        cfg = config_file
+    else:
+        if apply_postprocessing:
+            hydra_overrides_extra = hydra_overrides_extra.copy()
+            hydra_overrides_extra += [
+                "++model.sam_mask_decoder_extra_args.dynamic_multimask_via_stability=true",
+                "++model.sam_mask_decoder_extra_args.dynamic_multimask_stability_delta=0.05",
+                "++model.sam_mask_decoder_extra_args.dynamic_multimask_stability_thresh=0.98",
+            ]
+
+        cfg = compose(config_name=config_file, overrides=hydra_overrides_extra)
+
+    OmegaConf.resolve(cfg)
+    model = instantiate(cfg.model, _recursive_=True)
+
+    if ckpt_path:
+        checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+        if "model" in checkpoint:
+            model.load_state_dict(checkpoint["model"], strict=False)
+        else:
+            model.load_state_dict(checkpoint, strict=False)
+
+    model.to(device)
+    if mode == "train":
+        model.train()
+    else:
+        model.eval()
+
+    return model
+
+
 # --- Model Configuration ---
 # These should ideally be configurable or passed as arguments
-FLORENCE2_MODEL_ID = "microsoft/Florence-2-large"
+FLORENCE2_MODEL_ID = "microsoft/Florence-2-base"
 # Make sure SAM2_CHECKPOINT and SAM2_CONFIG paths are correct for your setup
 # For now, assuming they might be in a 'checkpoints' or 'configs' directory relative to the project root
 # or that the SAM2 library handles finding them if installed system-wide.
 # These paths will likely need adjustment based on actual installation.
 SAM2_CHECKPOINT_PATH = os.getenv("SAM2_CHECKPOINT_PATH", "checkpoints/sam2.1_hiera_large.pt") # Or your actual path
-SAM2_CONFIG_PATH = os.getenv("SAM2_CONFIG_PATH", "configs/sam2.1/sam2.1_hiera_l.yaml") # Or your actual path
+SAM2_CONFIG_PATH = "sam2.1_hiera_l.yaml" # Or your actual path
 
 # Task prompt for Florence-2. Open Vocabulary Detection seems most appropriate for "find 'object'"
 FLORENCE2_TASK_PROMPT = "<OPEN_VOCABULARY_DETECTION>"
@@ -75,8 +130,12 @@ def initialize_models(device_str: str):
         raise FileNotFoundError(f"SAM2 Checkpoint not found at {SAM2_CHECKPOINT_PATH}. Please set SAM2_CHECKPOINT_PATH or place it correctly.")
     if not os.path.exists(SAM2_CONFIG_PATH):
          raise FileNotFoundError(f"SAM2 Config not found at {SAM2_CONFIG_PATH}. Please set SAM2_CONFIG_PATH or place it correctly.")
-
-    sam2_model_torch = build_sam2(SAM2_CONFIG_PATH, SAM2_CHECKPOINT_PATH, device=device_str)
+    # Load the YAML config manually from file
+    yaml_path = os.path.abspath("/home/acidhax/dev/VideoTrackingDeformationAnalysis/configs/sam2.1/sam2.1_hiera_l.yaml")
+    cfg = OmegaConf.load(yaml_path)
+    sam2_checkpoint = "/home/acidhax/dev/VideoTrackingDeformationAnalysis/checkpoints/sam2.1_hiera_large.pt"
+    DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    sam2_model_torch = build_sam2_(cfg, sam2_checkpoint, device=DEVICE)
     sam2_predictor = SAM2ImagePredictor(sam2_model_torch)
     print("SAM2ImagePredictor initialized.")
 
@@ -93,6 +152,9 @@ def run_florence2_od(
     if hasattr(inputs, 'pixel_values') and inputs.pixel_values.dtype == torch.float32 and device.type == 'cuda':
         inputs.pixel_values = inputs.pixel_values.to(torch.bfloat16) # Or float16 if bfloat16 not supported
 
+    # Debug: Print input IDs and pixel values shapes
+    print(f"    [F2 Debug] input_ids shape: {inputs['input_ids'].shape}")
+    print(f"    [F2 Debug] pixel_values shape: {inputs['pixel_values'].shape}, dtype: {inputs['pixel_values'].dtype}")
 
     generated_ids = model.generate(
         input_ids=inputs["input_ids"],
@@ -103,10 +165,13 @@ def run_florence2_od(
         num_beams=3,
     )
     generated_text = processor.batch_decode(generated_ids, skip_special_tokens=False)[0]
+    print(f"    [F2 Debug] Generated text (raw): {generated_text}") # DEBUG
+
     # The post_process_generation for OD returns a dict like: {'<OD>': {'bboxes': [[x1,y1,x2,y2], ...], 'labels': ["label1", ...]}}
     parsed_answer = processor.post_process_generation(
         generated_text, task=task_prompt, image_size=(image_pil.width, image_pil.height)
     )
+    print(f"    [F2 Debug] Parsed answer from post_process_generation: {parsed_answer}") # DEBUG
     return parsed_answer
 
 
@@ -117,7 +182,8 @@ def generate_initial_multipart_masks(
     reference_frame_index: int = 0,
     sam_checkpoint: str = SAM2_CHECKPOINT_PATH, # Allow override
     sam_config: str = SAM2_CONFIG_PATH, # Allow override
-    florence_model_id: str = FLORENCE2_MODEL_ID # Allow override
+    florence_model_id: str = FLORENCE2_MODEL_ID, # Allow override
+    visual_preview: bool = True # User changed default to True
 ):
     """
     Generates initial segmentation masks for multiple parts based on text prompts
@@ -134,6 +200,7 @@ def generate_initial_multipart_masks(
         sam_checkpoint (str): Path to SAM2 model checkpoint.
         sam_config (str): Path to SAM2 model config.
         florence_model_id (str): HuggingFace model ID for Florence-2.
+        visual_preview (bool): Whether to display a visual preview of the reference frame.
     """
     if not SAM2_AVAILABLE or not FLORENCE2_AVAILABLE:
         print("Error: SAM2 or Florence-2 dependencies are not met. Cannot proceed.")
@@ -142,112 +209,110 @@ def generate_initial_multipart_masks(
     # Update global paths if overridden
     global SAM2_CHECKPOINT_PATH, SAM2_CONFIG_PATH, FLORENCE2_MODEL_ID
     SAM2_CHECKPOINT_PATH = sam_checkpoint
-    SAM2_CONFIG_PATH = sam_config
+    SAM2_CONFIG_PATH = "configs/sam2.1/sam2.1_hiera_l.yaml" # Keep specific path for now
     FLORENCE2_MODEL_ID = florence_model_id
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
     
-    # Set up torch environment settings for CUDA if available
+    # Set up torch environment settings for CUDA if available - outside autocast context
     if device == "cuda":
-        torch.autocast(device_type="cuda", dtype=torch.bfloat16).__enter__()
         if torch.cuda.get_device_properties(0).major >= 8: # Ampere+
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
 
+    def _generate_masks_logic():
+        frame_np_hwc_rgb = load_reference_frame(video_path, reference_frame_index)
+        if frame_np_hwc_rgb is None:
+            print(f"Could not load reference frame {reference_frame_index} from {video_path}. Aborting.")
+            return
 
-    frame_np_hwc_rgb = load_reference_frame(video_path, reference_frame_index)
-    if frame_np_hwc_rgb is None:
-        print(f"Could not load reference frame {reference_frame_index} from {video_path}. Aborting.")
-        return
+        # --- VISUAL PREVIEW ---
+        if visual_preview:
+            import matplotlib.pyplot as plt
+            plt.figure(figsize=(6,6))
+            plt.imshow(frame_np_hwc_rgb)
+            plt.title(f"Reference Frame {reference_frame_index}")
+            plt.axis('off')
+            plt.show()
+        # --- END VISUAL PREVIEW ---
 
-    image_pil = Image.fromarray(frame_np_hwc_rgb)
+        image_pil = Image.fromarray(frame_np_hwc_rgb)
 
-    try:
-        florence2_model, florence2_processor, sam2_predictor = initialize_models(device)
-    except (RuntimeError, FileNotFoundError) as e:
-        print(f"Error initializing models: {e}. Aborting.")
-        return
-
-    labeled_masks = {}
-    sam2_predictor.set_image(frame_np_hwc_rgb) # Set image once for SAM2
-
-    print(f"Processing {len(text_prompts)} text prompts: {text_prompts}")
-    for text_prompt in text_prompts:
-        print(f"  Processing prompt: '{text_prompt}'")
         try:
-            # Run Florence-2 to get bounding boxes for the current text prompt
-            # For open_vocabulary_detection, the text_input is the objects to detect
-            florence_results = run_florence2_od(
-                florence2_model, florence2_processor, image_pil, text_input=text_prompt
-            )
-            
-            # Extract bboxes and labels. We expect one primary detection for the prompt.
-            # The result format is {'<OPEN_VOCABULARY_DETECTION>': {'bboxes': [[x,y,x,y], ...], 'labels': ['text_prompt', ...]}}
-            detections = florence_results.get(FLORENCE2_TASK_PROMPT, {})
-            bboxes_all = detections.get("bboxes", [])
-            labels_all = detections.get("labels", [])
+            florence2_model, florence2_processor, sam2_predictor = initialize_models(device)
+        except (RuntimeError, FileNotFoundError) as e:
+            print(f"Error initializing models: {e}. Aborting.")
+            return
 
-            # Filter for boxes that match the current prompt, though OD often returns the prompt as label
-            input_boxes_for_prompt = []
-            for i, label in enumerate(labels_all):
-                # Simple exact match, might need more sophisticated matching if Florence-2 adds qualifiers
-                if label.lower() == text_prompt.lower() and i < len(bboxes_all):
-                    input_boxes_for_prompt.append(bboxes_all[i])
-            
-            if not input_boxes_for_prompt:
-                print(f"    Florence-2 did not return a bounding box for prompt: '{text_prompt}'. Skipping.")
-                # print(f"    Full Florence-2 output for this prompt: {florence_results}") # For debugging
-                continue
+        labeled_masks = {}
+        sam2_predictor.set_image(frame_np_hwc_rgb) # Set image once for SAM2
 
-            # Take the first box if multiple are returned for the exact prompt (should be rare for specific parts)
-            # Or, one could decide to merge them or handle them differently.
-            # For SAM, we typically provide one box per object of interest for a clean mask.
-            # If Florence-2 returns multiple distinct objects for a single prompt (e.g. "two hands"),
-            # SAM will try to segment both within that one box, or we might need to pass boxes individually.
-            # For now, let's assume one primary box per part prompt.
-            
-            # We need to convert to numpy array for SAM2
-            # SAM expects N x 4 boxes
-            sam_input_box_np = np.array(input_boxes_for_prompt[0]).reshape(1, 4)
-            print(f"    Got box from Florence-2: {sam_input_box_np}")
+        print(f"Processing {len(text_prompts)} text prompts: {text_prompts}")
+        for text_prompt in text_prompts:
+            print(f"  Processing prompt: '{text_prompt}'")
+            try:
+                # Run Florence-2 to get bounding boxes for the current text prompt
+                florence_results = run_florence2_od(
+                    florence2_model, florence2_processor, image_pil, text_input=text_prompt
+                )
+                print(f"    [Main Debug] Full Florence-2 results for '{text_prompt}': {florence_results}") # DEBUG
+                
+                detections = florence_results.get(FLORENCE2_TASK_PROMPT, {})
+                bboxes_all = detections.get("bboxes", [])
+                labels_all = detections.get("bboxes_labels", [])
+                print(f"    [Main Debug] Extracted bboxes_all: {bboxes_all}") # DEBUG
+                print(f"    [Main Debug] Extracted labels_all: {labels_all}") # DEBUG
 
-            # Predict mask with SAM2 using the box
-            masks_sam, scores_sam, _ = sam2_predictor.predict(
-                point_coords=None,
-                point_labels=None,
-                box=sam_input_box_np, # Expects numpy array
-                multimask_output=False, # Get single best mask
-            )
-            
-            # masks_sam is typically (num_masks_output, H, W) bool array
-            if masks_sam.ndim == 3 and masks_sam.shape[0] == 1:
-                final_mask = masks_sam.squeeze(0) # Get (H, W) mask
-                labeled_masks[text_prompt] = final_mask.astype(bool) # Store boolean mask
-                print(f"    Generated and stored mask for '{text_prompt}'. Mask shape: {final_mask.shape}, Non-zero elements: {np.sum(final_mask)}")
-            else:
-                print(f"    SAM2 did not return a single valid mask for prompt '{text_prompt}' with box {sam_input_box_np}. Mask shape: {masks_sam.shape}. Skipping.")
+                input_boxes_for_prompt = []
+                for i, label in enumerate(labels_all):
+                    # Flexible label matching: check if prompt is IN the label
+                    if text_prompt.lower() in label.lower() and i < len(bboxes_all):
+                        input_boxes_for_prompt.append(bboxes_all[i])
+                
+                if not input_boxes_for_prompt:
+                    print(f"    Florence-2 did not return a bounding box for prompt: '{text_prompt}'. Skipping.")
+                    continue
 
-        except Exception as e:
-            print(f"    Error processing prompt '{text_prompt}': {e}")
-            import traceback
-            traceback.print_exc()
+                sam_input_box_np = np.array(input_boxes_for_prompt[0]).reshape(1, 4)
+                print(f"    Got box from Florence-2: {sam_input_box_np}")
 
-    if labeled_masks:
-        # Ensure output directory exists
-        output_dir = os.path.dirname(output_masks_path)
-        if output_dir and not os.path.exists(output_dir):
-            os.makedirs(output_dir, exist_ok=True)
-            print(f"Created output directory: {output_dir}")
+                masks_sam, scores_sam, _ = sam2_predictor.predict(
+                    point_coords=None,
+                    point_labels=None,
+                    box=sam_input_box_np,
+                    multimask_output=False,
+                )
+                
+                if masks_sam.ndim == 3 and masks_sam.shape[0] == 1:
+                    final_mask = masks_sam.squeeze(0)
+                    labeled_masks[text_prompt] = final_mask.astype(bool)
+                    print(f"    Generated and stored mask for '{text_prompt}'. Mask shape: {final_mask.shape}, Non-zero elements: {np.sum(final_mask)}")
+                else:
+                    print(f"    SAM2 did not return a single valid mask for prompt '{text_prompt}' with box {sam_input_box_np}. Mask shape: {masks_sam.shape}. Skipping.")
 
-        np.savez_compressed(output_masks_path, **labeled_masks)
-        print(f"Saved {len(labeled_masks)} labeled masks to: {output_masks_path}")
-        print(f"Labels saved: {list(labeled_masks.keys())}")
-    else:
-        print("No masks were generated. Output file not saved.")
+            except Exception as e:
+                print(f"    Error processing prompt '{text_prompt}': {e}")
+                import traceback
+                traceback.print_exc()
+
+        if labeled_masks:
+            output_dir = os.path.dirname(output_masks_path)
+            if output_dir and not os.path.exists(output_dir):
+                os.makedirs(output_dir, exist_ok=True)
+                print(f"Created output directory: {output_dir}")
+
+            np.savez_compressed(output_masks_path, **labeled_masks)
+            print(f"Saved {len(labeled_masks)} labeled masks to: {output_masks_path}")
+            print(f"Labels saved: {list(labeled_masks.keys())}")
+        else:
+            print("No masks were generated. Output file not saved.")
 
     if device == "cuda":
-        torch.autocast(device_type="cuda", enabled=False).__exit__(None, None, None)
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            _generate_masks_logic()
+    else:
+        _generate_masks_logic()
 
 
 if __name__ == "__main__":
@@ -255,7 +320,7 @@ if __name__ == "__main__":
 
     # --- Configuration for Example Usage ---
     # Create dummy video and checkpoint/config files if they don't exist for a basic run
-    DUMMY_VIDEO_PATH = "examples/videos/dummy_video.mp4"
+    DUMMY_VIDEO_PATH = "media/crow.mp4"
     DUMMY_OUTPUT_MASKS_PATH = "examples/outputs/stage_a_initial_masks.npz"
     
     # Ensure example directories exist
@@ -302,7 +367,7 @@ if __name__ == "__main__":
     # Example text prompts
     # These are illustrative. The success depends entirely on Florence-2's ability
     # to detect these specific terms in the given image.
-    prompts = ["bird body", "bird head", "bird tail", "bird leg"]
+    prompts = ["body", "head", "tail", "leg"]
     # prompts = ["a small red apple", "a green banana"] # More generic prompts
 
     print(f"Attempting to generate masks for prompts: {prompts}")
